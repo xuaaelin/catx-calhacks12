@@ -3,16 +3,23 @@
     "name": "EcoPrompt",
     "version": "1.0",
     "description": "Track and optimize LLM prompt efficiency in real time.",
-    "permissions": ["storage", "scripting", "activeTab"],
+    "permissions": ["storage", "scripting", "activeTab", "notifications"],
+    "background": {
+      "service_worker": "background.js"
+    },
     "content_scripts": [
       {
-        "matches": ["https://chat.openai.com/*", "https://claude.ai/*","https://chatgpt.com/*"],
+        "matches": [
+          "https://chat.openai.com/*",
+          "https://claude.ai/*",
+          "https://chatgpt.com/*"
+        ],
         "js": ["content.js"]
       }
     ],
     "action": {
-      "default_popup": "popup.html",
-      "default_icon": "icon.png"
+      "default_popup": "eco.html",
+      "default_icon": "catx.png"
     }
   }
   
