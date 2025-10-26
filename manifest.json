@@ -24,12 +24,12 @@
     "web_accessible_resources": [
       {
         "resources": [
-          "happy1.jpeg",
-          "happy2.jpeg",
-          "lesshappy3.jpeg",
-          "lesshappy4.jpeg",
-          "sad5.jpeg",
-          "sad6.jpeg"
+          "happy1.png",
+          "happy2.png",
+          "lesshappy3.png",
+          "lesshappy4.png",
+          "sad5.png",
+          "sad6.png"
         ],
         "matches": ["<all_urls>"]
       }

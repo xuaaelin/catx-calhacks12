@@ -5,15 +5,16 @@ const ECO_TEXT_ID = "eco-prompt-text";
 const ECO_ICON_ID = "eco-prompt-icon";
 const ECO_ADVICE_ID = "eco-prompt-advice";
 const ECO_TOTALS_ID = "eco-prompt-totals";
+const ECO_OUTPUT_ID = "eco-prompt-output";
 const ECO_POS_KEY = "eco_prompt_pos";
 const ECO_TOTAL_KEY = "eco_prompt_totals";
 const FRAME_FILES = [
-  "happy1.jpeg",
-  "happy2.jpeg",
-  "lesshappy3.jpeg",
-  "lesshappy4.jpeg",
-  "sad5.jpeg",
-  "sad6.jpeg"
+  "happy1.png",
+  "happy2.png",
+  "lesshappy3.png",
+  "lesshappy4.png",
+  "sad5.png",
+  "sad6.png"
 ];
 
 // Cumulative totals storage
@@ -32,6 +33,7 @@ let convoVec = null; // Float32Array
 let convoCount = 0;
 let lastSendTs = 0;
 let convoKeyFreq = new Map(); // keyword -> count
+let lastActivityTs = Date.now(); // updated on typing, send, and when outputs stream
 
 function getConversationKey() {
   // Consider a new chat only when the path changes (ignore query/hash churn).
@@ -47,6 +49,14 @@ function resetTotals() {
   convoVec = null;
   convoCount = 0;
   convoKeyFreq = new Map();
+  // Clear output tracking so we will baseline again next time
+  try {
+    observedObservers.forEach(o => { try { o.disconnect(); } catch(e){} });
+    observedObservers = [];
+  } catch(e) {}
+  countedTokenMap = new WeakMap();
+  observedOutputNodes = new WeakMap();
+  outputsBaselined = false;
   const w = getWidget();
   const t = w.querySelector(`#${ECO_TEXT_ID}`);
   if (t) t.textContent = `Current: Energy ${format(0, "Wh")} · Water ${format(0, "mL")} · CO₂ ${format(0, "g")} · ${format(0, "tokens")}`;
@@ -60,6 +70,14 @@ function resetTotals() {
 
 function checkConversationChange() {
   try {
+    // Never reset totals on claude.ai per user request
+    if ((location.hostname || '').includes('claude.ai')) {
+      const now = Date.now();
+      localStorage.setItem(CONVO_STORAGE_KEY, getConversationKey());
+      localStorage.setItem(CONVO_STORAGE_KEY + ":ts", String(now));
+      if (window.ECO_DEBUG) console.log("EcoPrompt: URL change ignored on claude.ai (no reset)");
+      return;
+    }
     const key = getConversationKey();
     const prev = localStorage.getItem(CONVO_STORAGE_KEY);
     // Debounce resets: avoid rapid replaceState churn
@@ -68,11 +86,18 @@ function checkConversationChange() {
     const enoughTime = now - lastTs > 1000; // 1s guard
     // Also avoid resetting within 2s of a send (path changes some sites do)
     const avoidAfterSend = now - lastSendTs < 2000;
-    if (prev !== key && enoughTime && !avoidAfterSend) {
+    // Avoid resetting if there was recent activity (typing or streaming outputs)
+    const recentActivity = now - (lastActivityTs || 0) < 120000; // 120s guard
+    if (prev !== key && enoughTime && !avoidAfterSend && !recentActivity) {
       localStorage.setItem(CONVO_STORAGE_KEY, key);
       localStorage.setItem(CONVO_STORAGE_KEY + ":ts", String(now));
       resetTotals();
       console.log("EcoPrompt: new chat detected, totals reset.");
+    } else if (prev !== key) {
+      // Update the stored key timestamp but skip reset due to recent activity
+      localStorage.setItem(CONVO_STORAGE_KEY, key);
+      localStorage.setItem(CONVO_STORAGE_KEY + ":ts", String(now));
+      if (window.ECO_DEBUG) console.log("EcoPrompt: URL changed but skipped reset due to recent activity.");
     }
   } catch (e) {}
 }
@@ -188,22 +213,24 @@ function computeUsageScore({ energyWh, waterMl, co2g, tokens }) {
 }
 
 function setUsageIcon(icon, currentTokens) {
-  // Use cumulative tokens to determine bear happiness
-  const totalTokens = cumulativeTotals.tokens;
-  
-  console.log(`Total tokens consumed: ${totalTokens}`);
-  
-  // Bear gets sadder as total consumption increases
-  let frameIdx = 0; // Start happy
-  
-  if (totalTokens < 100) frameIdx = 0;         // happy1 (0-100 tokens)
-  else if (totalTokens < 500) frameIdx = 1;    // happy2 (100-500 tokens)
-  else if (totalTokens < 1000) frameIdx = 2;   // neutral3 (500-1k tokens)
-  else if (totalTokens < 2000) frameIdx = 3;   // lesshappy4 (1k-2k tokens)
-  else if (totalTokens < 5000) frameIdx = 4;   // sad5 (2k-5k tokens)
-  else frameIdx = 5;                           // sad6 (5k+ tokens)
-  
-  console.log(`Bear frame index: ${frameIdx} based on ${totalTokens} total tokens`);
+  // Convert current tokens to water (mL): per token water = 0.0085 Wh * 0.5 mL/Wh = 0.00425 mL
+  const currentWater = (currentTokens || 0) * 0.00425;
+  const sumWater = (cumulativeTotals.waterMl || 0) + currentWater;
+  // Thresholds in mL, scaled so median (between frames 2 and 3) is 0.23 mL
+  // Derived by scaling prior token thresholds (100,500,1000,2000,5000) -> water (0.425,2.125,4.25,8.5,21.25)
+  // by factor 0.23 / 4.25 ≈ 0.054117647.
+  const T1 = 2.30;   // frame 0 -> 1
+  const T2 = 11.49;   // frame 1 -> 2
+  const T3 = 23;     // frame 2 -> 3 (median)
+  const T4 = 45.9;    // frame 3 -> 4
+  const T5 = 114.8;    // frame 4 -> 5
+  let frameIdx = 0;
+  if (sumWater < T1) frameIdx = 0;
+  else if (sumWater < T2) frameIdx = 1;
+  else if (sumWater < T3) frameIdx = 2;
+  else if (sumWater < T4) frameIdx = 3;
+  else if (sumWater < T5) frameIdx = 4;
+  else frameIdx = 5;
   setIconFrame(icon, frameIdx);
 }
 
@@ -258,9 +285,14 @@ function getWidget() {
     totals.id = ECO_TOTALS_ID;
     totals.style.opacity = "0.8";
     totals.textContent = "Total: Energy 0 Wh · CO₂ 0 g · 0 tokens";
+    const out = document.createElement("span");
+    out.id = ECO_OUTPUT_ID;
+    out.style.opacity = "0.9";
+    out.textContent = "Estimated output: ~0 tokens";
     textBox.appendChild(advice);
     textBox.appendChild(text);
     textBox.appendChild(totals);
+    textBox.appendChild(out);
     setIconFrame(icon, 0);
     el.appendChild(icon);
     el.appendChild(textBox);
@@ -274,6 +306,16 @@ function getWidget() {
 
 function format(n, unit) {
   return `${n.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${unit}`;
+}
+
+function getEstimatedOutputCap() {
+  const host = location.hostname;
+  // Conversational UI caps (approximate)
+  if (host.includes('chatgpt.com') || host.includes('chat.openai.com')) return 4096; // GPT-4o via ChatGPT app ~4k
+  if (host.includes('claude.ai')) return 4096; // conservative default for Claude UI
+  // API defaults (if ever used in web tools)
+  if (host.includes('openai.com')) return 16384; // GPT-4o API
+  return 4096;
 }
 
 function calculateImpact(text) {
@@ -307,23 +349,27 @@ let lastFocusedEditable = null;
 
 function commitSendNowFrom(el) {
   try {
-    // Recompute current impact from editor now to match what user sees
+    // Recompute current impact from editor now to match what user sees (for display only)
     let currentText = (getEditorValue(el) || "").trim();
-    // Fallback to last seen text if DOM cleared already
     if (!currentText && lastProcessedText) currentText = lastProcessedText;
     const impact = currentText ? calculateImpact(currentText) : lastCurrentImpact || { tokens: 0, energyWh: 0, waterMl: 0, co2Grams: 0 };
-    if (impact.tokens === 0 && impact.energyWh === 0 && impact.waterMl === 0 && impact.co2Grams === 0) return;
-    cumulativeTotals.tokens += impact.tokens;
-    cumulativeTotals.energyWh += impact.energyWh;
-    cumulativeTotals.waterMl += impact.waterMl;
-    cumulativeTotals.co2Grams += impact.co2Grams;
-    saveTotals();
-    // Update conversation embedding with the sent text
+    // Update conversation embedding with the sent text (but do not add to cumulative here)
     if (currentText) updateConversationModel(currentText);
+    // On claude.ai and chatgpt.com/chat.openai.com, immediately add current impact into totals at send-time
+    const host = (location.hostname || '');
+    const addInputNow = host.includes('claude.ai') || host.includes('chatgpt.com') || host.includes('chat.openai.com');
+    if (addInputNow && impact && impact.tokens > 0) {
+      cumulativeTotals.tokens += impact.tokens;
+      cumulativeTotals.energyWh += impact.energyWh;
+      cumulativeTotals.waterMl += impact.waterMl;
+      cumulativeTotals.co2Grams += impact.co2Grams;
+      saveTotals();
+    }
     // Reset current row to 0 immediately, update totals line
     renderTotals(impactFromTokens(0));
     // Suppress immediate subsequent re-render from pending input events
     suppressUntilTs = Date.now() + 350;
+    lastActivityTs = Date.now();
     // Prevent double-count when the input clears right after
     lastProcessedText = "";
     pendingSendConsumed = true;
@@ -333,6 +379,8 @@ function commitSendNowFrom(el) {
     // Allow next send shortly after
     setTimeout(() => { pendingSendConsumed = false; }, 300);
     lastSendTs = Date.now();
+    // Kick off aggressive output scanning for a short window so we catch streaming
+    startOutputBoostScan();
   } catch (e) {}
 }
 
@@ -353,15 +401,27 @@ function maybeCommitPendingSend() {
   if (pendingSendConsumed) return;
   const text = (pendingSendText || "").trim();
   if (!text) return;
-  const sentImpact = calculateImpact(text);
-  cumulativeTotals.tokens += sentImpact.tokens;
-  cumulativeTotals.energyWh += sentImpact.energyWh;
-  cumulativeTotals.waterMl += sentImpact.waterMl;
-  cumulativeTotals.co2Grams += sentImpact.co2Grams;
-  saveTotals();
+  // Do not add to cumulative here; outputs will be accumulated separately
+  updateConversationModel(text);
+  // On claude.ai and chatgpt.com/chat.openai.com, also add current snapshot to totals when we had a pending send
+  {
+    const host = (location.hostname || '');
+    const addInputNow = host.includes('claude.ai') || host.includes('chatgpt.com') || host.includes('chat.openai.com');
+    if (addInputNow) {
+      const sentImpact = calculateImpact(text);
+      if (sentImpact && sentImpact.tokens > 0) {
+        cumulativeTotals.tokens += sentImpact.tokens;
+        cumulativeTotals.energyWh += sentImpact.energyWh;
+        cumulativeTotals.waterMl += sentImpact.waterMl;
+        cumulativeTotals.co2Grams += sentImpact.co2Grams;
+        saveTotals();
+      }
+    }
+  }
   pendingSendConsumed = true;
   // Reset current row to zero and refresh totals line
   renderTotals(impactFromTokens(0));
+  lastActivityTs = Date.now();
   // Clear snapshot shortly after to allow next send
   if (pendingSendTimer) clearTimeout(pendingSendTimer);
   pendingSendText = "";
@@ -381,6 +441,12 @@ function renderTotals(currentImpact) {
   const tot = w.querySelector(`#${ECO_TOTALS_ID}`);
   if (tot) {
     tot.textContent = `Total: Energy ${format(cumulativeTotals.energyWh, "Wh")} · CO₂ ${format(cumulativeTotals.co2Grams, "g")} · ${format(cumulativeTotals.tokens, "tokens")}`;
+  }
+  const out = w.querySelector(`#${ECO_OUTPUT_ID}`);
+  if (out) {
+    const cap = getEstimatedOutputCap();
+    const remaining = Math.max(0, Math.floor(cap - (lastCurrentImpact.tokens || 0)));
+    out.textContent = `Estimated output remaining: ~${format(remaining, "tokens")} (cap ${format(cap, "tokens")})`;
   }
   const icon = w.querySelector(`#${ECO_ICON_ID}`);
   if (icon) {
@@ -412,6 +478,8 @@ function updateWidget(text, anchorEl) {
     const current = calculateImpact(trimmedText);
     renderTotals(current);
   }
+  // Any typing/edit counts as recent activity to prevent accidental resets
+  lastActivityTs = Date.now();
   // Update advice based on similarity to conversation context
   updateAdviceForText(trimmedText);
 
@@ -448,6 +516,144 @@ function updateWidget(text, anchorEl) {
   }
   
   return w;
+}
+
+// --- Accumulate assistant outputs (LLM responses) ---
+const ECO_ASSIST_COUNT_KEY = "eco_assist_counted";
+let countedTokenMap = new WeakMap(); // Element -> counted token total
+let observedOutputNodes = new WeakMap(); // Element -> MutationObserver
+let observedObservers = [];
+let outputsBaselined = false;
+
+function getAssistantSelectors() {
+  const host = location.hostname;
+  const generic = [
+    '[data-message-author-role="assistant"]',
+    '[data-testid*="assistant" i]',
+    'article[aria-live]',
+    '[role="article"]',
+    '[class*="assistant" i]',
+    '[data-role*="assistant" i]'
+  ];
+  if (host.includes('chatgpt.com') || host.includes('chat.openai.com')) {
+    generic.push(
+      '[data-message-author-role="assistant"]',
+      '[data-testid="conversation-turn"] [data-message-author-role="assistant"]',
+      '[data-testid="conversation-turn"] article',
+      'main article'
+    );
+  }
+  if (host.includes('claude.ai')) {
+    generic.push(
+      '[data-testid="assistant-message"]',
+      '[data-testid="answer"]',
+      'div[data-testid*="assistant" i]',
+      'main [data-testid="message"] article',
+      'div[aria-live="polite"] article',
+      'section[aria-label*="Chat" i] article',
+      // Broader fallbacks seen on Claude variants
+      'main article',
+      'article',
+      '[data-testid="message"] article',
+      'div.markdown, div.prose',
+      // User-provided outer container class
+      '.font-claude-response',
+      '[class*="font-claude-response"]'
+    );
+  }
+  return Array.from(new Set(generic));
+}
+
+function getAssistantNodes() {
+  try {
+    const nodes = deepQueryAll(getAssistantSelectors());
+    return nodes.filter(n => n && n.isConnected && !n.closest?.(`#${ECO_ID}`));
+  } catch (e) {
+    return [];
+  }
+}
+
+async function tokenizeForHost(text) {
+  const host = location.hostname;
+  try {
+    if (host.includes('claude.ai')) return await countTokensClaude(text);
+    // default to OpenAI cl100k
+    return await countTokensOpenAI(text);
+  } catch (e) {
+    // Fallback heuristic if CDN blocked or tokenizer fails
+    return Math.ceil((text || '').length / 4);
+  }
+}
+
+async function scanAndAccumulateOutputs() {
+  try {
+    const nodes = getAssistantNodes();
+    // On first detection after load, baseline counts without adding to totals
+    if (!outputsBaselined && nodes.length) {
+      for (const el of nodes) {
+        const txt0 = (el.innerText || el.textContent || '').trim();
+        if (!txt0) continue;
+        const cur0 = Number(await tokenizeForHost(txt0)) || 0;
+        countedTokenMap.set(el, cur0);
+      }
+      outputsBaselined = true;
+      // Continue to attach observers below so streaming gets counted
+    }
+    for (const el of nodes) {
+      const txt = (el.innerText || el.textContent || '').trim();
+      if (!txt) continue;
+      const prev = countedTokenMap.get(el) || 0;
+      const cur = Number(await tokenizeForHost(txt)) || 0;
+      if (cur > prev) {
+        const delta = cur - prev;
+        const deltaImpact = impactFromTokens(delta);
+        cumulativeTotals.tokens += deltaImpact.tokens;
+        cumulativeTotals.energyWh += deltaImpact.energyWh;
+        cumulativeTotals.waterMl += deltaImpact.waterMl;
+        cumulativeTotals.co2Grams += deltaImpact.co2Grams;
+        countedTokenMap.set(el, cur);
+        saveTotals();
+        lastActivityTs = Date.now();
+        if (ECO_DEBUG) {
+          console.log('EcoPrompt output delta', { tokensDelta: delta, newTotal: cumulativeTotals.tokens, node: el });
+        }
+        // Refresh totals line; keep current at whatever is being typed
+        renderTotals(lastCurrentImpact || impactFromTokens(0));
+      }
+      // Attach a streaming observer once per node to catch incremental updates
+      if (!observedOutputNodes.has(el)) {
+        try {
+          const obs = new MutationObserver(() => {
+            // Schedule a lightweight rescan for just this node
+            Promise.resolve().then(async () => {
+              try {
+                const t2 = (el.innerText || el.textContent || '').trim();
+                if (!t2) return;
+                const prev2 = countedTokenMap.get(el) || 0;
+                const cur2 = Number(await tokenizeForHost(t2)) || 0;
+                if (cur2 > prev2) {
+                  const d = cur2 - prev2;
+                  const imp = impactFromTokens(d);
+                  cumulativeTotals.tokens += imp.tokens;
+                  cumulativeTotals.energyWh += imp.energyWh;
+                  cumulativeTotals.waterMl += imp.waterMl;
+                  cumulativeTotals.co2Grams += imp.co2Grams;
+                  countedTokenMap.set(el, cur2);
+                  saveTotals();
+                  lastActivityTs = Date.now();
+                  if (ECO_DEBUG) console.log('EcoPrompt output delta (stream)', { tokensDelta: d, newTotal: cumulativeTotals.tokens });
+                  renderTotals(lastCurrentImpact || impactFromTokens(0));
+                }
+              } catch (_) {}
+            });
+          });
+          obs.observe(el, { subtree: true, childList: true, characterData: true });
+          observedOutputNodes.set(el, obs);
+          observedObservers.push(obs);
+        } catch (_) {}
+      }
+    }
+  } catch (e) {}
 }
 
 function throttle(fn, ms) {
@@ -713,8 +919,8 @@ function updateAdviceForText(text) {
   if (ECO_DEBUG) {
     console.log("EcoPrompt advice:", { keys, sim: Number(sim.toFixed(3)), overlap: Number(overlap.toFixed(3)), convoCount });
   }
-  // Trigger advice if either cosine is low or keyword overlap is low
-  if (sim < 0.6 || overlap < 0.2) {
+  // Trigger advice only if both cosine and keyword overlap are low
+  if (sim < 0.45 && overlap < 0.15) {
     adv.style.display = "block";
     adv.textContent = "Tip: This prompt seems unrelated. Start a new chat for better efficiency.";
   } else {
@@ -793,12 +999,34 @@ function hookTextareas() {
   nodes.forEach((el) => attachListeners(el));
   // Also check if conversation changed while DOM updated
   checkConversationChange();
+  // Scan for assistant outputs on each mutation pass
+  scanAndAccumulateOutputs();
 }
 
 const observer = new MutationObserver(hookTextareas);
 observer.observe(document.body, { childList: true, subtree: true });
 hookTextareas();
 let rescanTimer = setInterval(hookTextareas, 1500);
+// Periodically scan for assistant outputs in case of streaming updates
+let outputScanTimer = setInterval(scanAndAccumulateOutputs, 800);
+
+// After a send, increase scan frequency briefly to catch streaming outputs quickly
+let boostTimer = null;
+let boostUntil = 0;
+function startOutputBoostScan() {
+  try {
+    boostUntil = Date.now() + 15000; // 15s window
+    if (boostTimer) clearInterval(boostTimer);
+    boostTimer = setInterval(() => {
+      if (Date.now() > boostUntil) {
+        clearInterval(boostTimer);
+        boostTimer = null;
+        return;
+      }
+      scanAndAccumulateOutputs();
+    }, 150);
+  } catch (e) {}
+}
 
 // Detect SPA URL changes (new chat) and reset totals
 function patchHistoryForUrlEvents() {
