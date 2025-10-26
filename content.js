@@ -3,6 +3,8 @@ console.log("EcoPrompt active ");
 const ECO_ID = "eco-prompt-widget";
 const ECO_TEXT_ID = "eco-prompt-text";
 const ECO_ICON_ID = "eco-prompt-icon";
+const ECO_ADVICE_ID = "eco-prompt-advice";
+const ECO_TOTALS_ID = "eco-prompt-totals";
 const ECO_POS_KEY = "eco_prompt_pos";
 const ECO_TOTAL_KEY = "eco_prompt_totals";
 const FRAME_FILES = [
@@ -24,6 +26,110 @@ let cumulativeTotals = {
 
 let usageAvg = null;
 let lastTextLength = 0;
+const CONVO_STORAGE_KEY = "eco_prompt_convo_key";
+// Conversation embedding state (resets per chat)
+let convoVec = null; // Float32Array
+let convoCount = 0;
+let lastSendTs = 0;
+let convoKeyFreq = new Map(); // keyword -> count
+
+function getConversationKey() {
+  // Consider a new chat only when the path changes (ignore query/hash churn).
+  return `${location.host}${location.pathname}`;
+}
+
+function resetTotals() {
+  cumulativeTotals = { tokens: 0, energyWh: 0, waterMl: 0, co2Grams: 0 };
+  saveTotals();
+  usageAvg = null;
+  lastProcessedText = "";
+  // Reset conversation model and advice
+  convoVec = null;
+  convoCount = 0;
+  convoKeyFreq = new Map();
+  const w = getWidget();
+  const t = w.querySelector(`#${ECO_TEXT_ID}`);
+  if (t) t.textContent = `Current: Energy ${format(0, "Wh")} · Water ${format(0, "mL")} · CO₂ ${format(0, "g")} · ${format(0, "tokens")}`;
+  const tot = w.querySelector(`#${ECO_TOTALS_ID}`);
+  if (tot) tot.textContent = `Total: Energy ${format(0, "Wh")} · CO₂ ${format(0, "g")} · ${format(0, "tokens")}`;
+  const adv = w.querySelector(`#${ECO_ADVICE_ID}`);
+  if (adv) { adv.style.display = "none"; adv.textContent = ""; }
+  const icon = w.querySelector(`#${ECO_ICON_ID}`);
+  if (icon) setUsageIcon(icon, 0);
+}
+
+function checkConversationChange() {
+  try {
+    const key = getConversationKey();
+    const prev = localStorage.getItem(CONVO_STORAGE_KEY);
+    // Debounce resets: avoid rapid replaceState churn
+    const now = Date.now();
+    const lastTs = Number(localStorage.getItem(CONVO_STORAGE_KEY + ":ts")) || 0;
+    const enoughTime = now - lastTs > 1000; // 1s guard
+    // Also avoid resetting within 2s of a send (path changes some sites do)
+    const avoidAfterSend = now - lastSendTs < 2000;
+    if (prev !== key && enoughTime && !avoidAfterSend) {
+      localStorage.setItem(CONVO_STORAGE_KEY, key);
+      localStorage.setItem(CONVO_STORAGE_KEY + ":ts", String(now));
+      resetTotals();
+      console.log("EcoPrompt: new chat detected, totals reset.");
+    }
+  } catch (e) {}
+}
+
+// lazy singleton
+let openaiTok;
+async function getOpenAiTokenizer() {
+  if (openaiTok) return openaiTok;
+  // Use @dqbd/tiktoken lite with cl100k_base
+  const { Tiktoken } = await import('https://esm.sh/@dqbd/tiktoken/lite?target=es2022');
+  const cl100k_base = (await import('https://esm.sh/@dqbd/tiktoken/encoders/cl100k_base.json')).default;
+  const enc = new Tiktoken(
+    cl100k_base.bpe_ranks,
+    cl100k_base.special_tokens,
+    cl100k_base.pat_str
+  );
+  openaiTok = {
+    encode: (text) => enc.encode(text || ''),
+    decode: (arr) => enc.decode(arr || []),
+    _enc: enc,
+  };
+  return openaiTok;
+}
+
+async function countTokensOpenAI(text) {
+  const tok = await getOpenAiTokenizer();
+  return tok.encode(text).length; // cl100k_base by default
+}
+
+let claudeTok;
+async function getClaudeTokenizer() {
+  if (claudeTok) return claudeTok;
+  const mod = await import('https://esm.sh/@anthropic-ai/tokenizer@0.1.9');
+  claudeTok = mod;
+  return claudeTok;
+}
+
+async function countTokensClaude(text) {
+  const tok = await getClaudeTokenizer();
+  return tok.countTokens(text);
+}
+
+async function getAccurateTokenCount(text) {
+  const host = location.hostname;
+  try {
+    if (host.includes('chat.openai.com') || host.includes('chatgpt.com')) {
+      return await countTokensOpenAI(text);
+    }
+    if (host.includes('claude.ai')) {
+      return await countTokensClaude(text);
+    }
+  } catch (e) {
+    // fall through to heuristic
+  }
+  // Fallback heuristic
+  return Math.ceil((text || '').length / 4);
+}
 
 // Load saved totals on startup
 function loadTotals() {
@@ -49,16 +155,22 @@ function saveTotals() {
 
 function setIconFrame(img, idx) {
   const i = Math.max(0, Math.min(FRAME_FILES.length - 1, Math.floor(idx)));
-  const name = FRAME_FILES[i];
-  console.log(`Setting bear frame to: ${name} (index ${i})`);
-  try {
-    const url = chrome.runtime?.getURL ? chrome.runtime.getURL(name) : name;
+  const base = FRAME_FILES[i];
+  const candidates = [base,
+    base.replace(/\.jpe?g$/i, ".jpeg"),
+    base.replace(/\.jpe?g$/i, ".jpg"),
+    base.replace(/\.jpe?g$/i, ".png")
+  ].filter((v, k, a) => v && a.indexOf(v) === k);
+  let tried = 0;
+  function tryNext() {
+    if (tried >= candidates.length) return;
+    const name = candidates[tried++];
+    let url = name;
+    try { url = chrome.runtime?.getURL ? chrome.runtime.getURL(name) : name; } catch(e) {}
+    img.onerror = () => tryNext();
     img.src = url;
-    console.log(`Bear image URL: ${url}`);
-  } catch (e) {
-    img.src = name;
-    console.error("Failed to load bear image:", e);
   }
+  tryNext();
 }
 
 function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
@@ -129,13 +241,29 @@ function getWidget() {
     icon.style.flex = "0 0 auto";
     icon.alt = "usage";
     
+    const textBox = document.createElement("div");
+    textBox.style.display = "flex";
+    textBox.style.flexDirection = "column";
+    textBox.style.lineHeight = "1.25";
+    const advice = document.createElement("span");
+    advice.id = ECO_ADVICE_ID;
+    advice.style.display = "none";
+    advice.style.color = "#f59e0b"; // amber
+    advice.style.fontWeight = "600";
+    advice.textContent = "";
     const text = document.createElement("span");
     text.id = ECO_TEXT_ID;
-    text.textContent = "EcoPrompt: Ready...";
-    
+    text.textContent = "Current: Energy 0 Wh · Water 0 mL · CO₂ 0 g · 0 tokens";
+    const totals = document.createElement("span");
+    totals.id = ECO_TOTALS_ID;
+    totals.style.opacity = "0.8";
+    totals.textContent = "Total: Energy 0 Wh · CO₂ 0 g · 0 tokens";
+    textBox.appendChild(advice);
+    textBox.appendChild(text);
+    textBox.appendChild(totals);
     setIconFrame(icon, 0);
     el.appendChild(icon);
-    el.appendChild(text);
+    el.appendChild(textBox);
     
     restorePosition(el);
     makeDraggable(el);
@@ -156,52 +284,157 @@ function calculateImpact(text) {
   const waterMl = energyWh * 0.5;
   const co2Grams = (energyWh / 1000) * 430;
   
-  return { tokens, energyWh, waterMl, co2Grams };
+  return {tokens, energyWh, waterMl, co2Grams};
+}
+
+function impactFromTokens(tokens) {
+  const t = Math.max(0, Math.ceil(tokens || 0));
+  const energyWh = t * 0.0085;
+  const waterMl = energyWh * 0.5;
+  const co2Grams = (energyWh / 1000) * 430;
+  return { tokens: t, energyWh, waterMl, co2Grams };
 }
 
 let userDragged = false;
 let lastProcessedText = "";
+let tokenizeRequestId = 0;
+let pendingSendText = "";
+let pendingSendTimer = null;
+let pendingSendConsumed = false;
+let lastCurrentImpact = { tokens: 0, energyWh: 0, waterMl: 0, co2Grams: 0 };
+let suppressUntilTs = 0;
+let lastFocusedEditable = null;
+
+function commitSendNowFrom(el) {
+  try {
+    // Recompute current impact from editor now to match what user sees
+    let currentText = (getEditorValue(el) || "").trim();
+    // Fallback to last seen text if DOM cleared already
+    if (!currentText && lastProcessedText) currentText = lastProcessedText;
+    const impact = currentText ? calculateImpact(currentText) : lastCurrentImpact || { tokens: 0, energyWh: 0, waterMl: 0, co2Grams: 0 };
+    if (impact.tokens === 0 && impact.energyWh === 0 && impact.waterMl === 0 && impact.co2Grams === 0) return;
+    cumulativeTotals.tokens += impact.tokens;
+    cumulativeTotals.energyWh += impact.energyWh;
+    cumulativeTotals.waterMl += impact.waterMl;
+    cumulativeTotals.co2Grams += impact.co2Grams;
+    saveTotals();
+    // Update conversation embedding with the sent text
+    if (currentText) updateConversationModel(currentText);
+    // Reset current row to 0 immediately, update totals line
+    renderTotals(impactFromTokens(0));
+    // Suppress immediate subsequent re-render from pending input events
+    suppressUntilTs = Date.now() + 350;
+    // Prevent double-count when the input clears right after
+    lastProcessedText = "";
+    pendingSendConsumed = true;
+    if (pendingSendTimer) clearTimeout(pendingSendTimer);
+    pendingSendText = "";
+    pendingSendTimer = null;
+    // Allow next send shortly after
+    setTimeout(() => { pendingSendConsumed = false; }, 300);
+    lastSendTs = Date.now();
+  } catch (e) {}
+}
+
+function setPendingSendFrom(el) {
+  try {
+    pendingSendText = getEditorValue(el) || "";
+    if (pendingSendTimer) clearTimeout(pendingSendTimer);
+    pendingSendTimer = setTimeout(() => {
+      pendingSendText = "";
+      pendingSendTimer = null;
+    }, 1500);
+    // Try to commit immediately on send trigger (avoid waiting for clear)
+    maybeCommitPendingSend();
+  } catch (e) {}
+}
+
+function maybeCommitPendingSend() {
+  if (pendingSendConsumed) return;
+  const text = (pendingSendText || "").trim();
+  if (!text) return;
+  const sentImpact = calculateImpact(text);
+  cumulativeTotals.tokens += sentImpact.tokens;
+  cumulativeTotals.energyWh += sentImpact.energyWh;
+  cumulativeTotals.waterMl += sentImpact.waterMl;
+  cumulativeTotals.co2Grams += sentImpact.co2Grams;
+  saveTotals();
+  pendingSendConsumed = true;
+  // Reset current row to zero and refresh totals line
+  renderTotals(impactFromTokens(0));
+  // Clear snapshot shortly after to allow next send
+  if (pendingSendTimer) clearTimeout(pendingSendTimer);
+  pendingSendText = "";
+  pendingSendTimer = null;
+  // Also reset lastProcessedText so future clear doesn't re-add
+  lastProcessedText = "";
+}
+
+function renderTotals(currentImpact) {
+  const w = getWidget();
+  const t = w.querySelector(`#${ECO_TEXT_ID}`);
+  if (t) {
+    t.textContent = `Current: Energy ${format(currentImpact.energyWh, "Wh")} · Water ${format(currentImpact.waterMl, "mL")} · CO₂ ${format(currentImpact.co2Grams, "g")} · ${format(currentImpact.tokens, "tokens")}`;
+  }
+  // Track last displayed current values for exact accumulation on send
+  lastCurrentImpact = currentImpact;
+  const tot = w.querySelector(`#${ECO_TOTALS_ID}`);
+  if (tot) {
+    tot.textContent = `Total: Energy ${format(cumulativeTotals.energyWh, "Wh")} · CO₂ ${format(cumulativeTotals.co2Grams, "g")} · ${format(cumulativeTotals.tokens, "tokens")}`;
+  }
+  const icon = w.querySelector(`#${ECO_ICON_ID}`);
+  if (icon) {
+    setUsageIcon(icon, currentImpact.tokens);
+  }
+}
+
+async function refineWithAccurateTokenizer(text) {
+  const id = ++tokenizeRequestId;
+  const trimmed = (text || "").trim();
+  try {
+    const tokens = await getAccurateTokenCount(trimmed);
+    if (id !== tokenizeRequestId) return; // stale
+    const current = impactFromTokens(tokens);
+    renderTotals(current);
+  } catch (e) {
+    // ignore, keep heuristic
+  }
+}
 
 function updateWidget(text, anchorEl) {
   const w = getWidget();
   const trimmedText = (text || "").trim();
-  
-  // Calculate current prompt impact
-  const current = calculateImpact(trimmedText);
-  
+  // If we just sent, keep current at zero briefly to make the reset visible
+  if (Date.now() < suppressUntilTs) {
+    renderTotals(impactFromTokens(0));
+  } else {
+    // Calculate current prompt impact
+    const current = calculateImpact(trimmedText);
+    renderTotals(current);
+  }
+  // Update advice based on similarity to conversation context
+  updateAdviceForText(trimmedText);
+
   // Detect if text was cleared (user sent message)
   const textCleared = lastProcessedText.length > 0 && trimmedText.length === 0;
   
   if (textCleared && lastProcessedText.length > 0) {
-    // Add last prompt to cumulative totals
-    const lastImpact = calculateImpact(lastProcessedText);
-    cumulativeTotals.tokens += lastImpact.tokens;
-    cumulativeTotals.energyWh += lastImpact.energyWh;
-    cumulativeTotals.waterMl += lastImpact.waterMl;
-    cumulativeTotals.co2Grams += lastImpact.co2Grams;
-    saveTotals();
-    console.log("Message sent! Added to cumulative totals:", lastImpact);
-    console.log("New cumulative totals:", cumulativeTotals);
+    // Only treat as send if we have a recent pending send snapshot
+    if (!pendingSendConsumed && pendingSendText && pendingSendText.trim().length > 0) {
+      maybeCommitPendingSend();
+    } else {
+      // Cleared without a send indicator (likely Ctrl/Cmd+A delete). Do not add.
+      console.log("Input cleared without send; not adding to totals.");
+    }
+    if (pendingSendTimer) clearTimeout(pendingSendTimer);
+    pendingSendText = "";
+    pendingSendTimer = null;
+    pendingSendConsumed = false;
   }
   
   lastProcessedText = trimmedText;
-  
-  // Display current + cumulative
-  const totalTokens = cumulativeTotals.tokens + current.tokens;
-  const totalEnergy = cumulativeTotals.energyWh + current.energyWh;
-  const totalWater = cumulativeTotals.waterMl + current.waterMl;
-  const totalCO2 = cumulativeTotals.co2Grams + current.co2Grams;
-  
-  const t = w.querySelector(`#${ECO_TEXT_ID}`);
-  if (t) {
-    t.textContent = `Total: Energy ${format(totalEnergy, "Wh")} · Water ${format(totalWater, "mL")} · CO₂ ${format(totalCO2, "g")} · ${format(totalTokens, "tokens")}`;
-  }
-  
-  // Update bear icon based on cumulative totals
-  const icon = w.querySelector(`#${ECO_ICON_ID}`);
-  if (icon) {
-    setUsageIcon(icon, current.tokens);
-  }
+  // Try to refine with accurate tokenizer asynchronously
+  refineWithAccurateTokenizer(trimmedText);
   
   // Only reposition if user hasn't manually dragged
   if (!userDragged && anchorEl && document.body.contains(anchorEl)) {
@@ -249,13 +482,245 @@ function getEditorValue(el) {
 function attachListeners(el) {
   if (!el || el.dataset.ecoHooked) return;
   el.dataset.ecoHooked = true;
+  el.addEventListener("focusin", () => { lastFocusedEditable = el; });
   const onEdit = throttle(() => {
     const text = getEditorValue(el);
     updateWidget(text, el);
+    lastFocusedEditable = el;
   }, 150);
   el.addEventListener("input", onEdit);
   el.addEventListener("keyup", onEdit);
+  // Capture large edits from non-keyboard interactions
+  const triggerImmediate = () => {
+    const text = getEditorValue(el);
+    updateWidget(text, el);
+  };
+  ["cut", "paste", "drop", "compositionend", "change"].forEach((evt) => {
+    el.addEventListener(evt, triggerImmediate);
+  });
+  // Detect Enter-based send (no modifiers)
+  el.addEventListener("keydown", (e) => {
+    // Enter to send (no modifiers)
+    if (e.key === "Enter" && !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey) {
+      // Immediately accumulate current stats into totals and reset current row
+      commitSendNowFrom(el);
+    }
+    // Backspace/Delete should reflect immediately (including after Ctrl/Cmd+A)
+    if (e.key === "Backspace" || e.key === "Delete") {
+      // Wait until DOM updates this keystroke, then recalc
+      requestAnimationFrame(() => {
+        const text = getEditorValue(el);
+        updateWidget(text, el);
+      });
+    }
+  });
+  // Detect click/submit on likely send buttons near the editor
+  try {
+    const form = el.closest("form");
+    if (form && !form.__ecoSendHooked) {
+      form.__ecoSendHooked = true;
+      form.addEventListener("submit", () => commitSendNowFrom(el));
+    }
+    // Common send buttons
+    const candidates = [
+      'button[type="submit"]',
+      '[data-testid*="send"]',
+      '[data-testid="send-button"]',
+      '[aria-label*="Send" i]',
+      '[title*="Send" i]',
+      'button svg[aria-label*="Send" i]'
+    ];
+    // Domain-specific additions for reliability
+    const host = location.hostname;
+    if (host.includes('chatgpt.com')) {
+      candidates.push('button[data-testid="send-button"]', '[aria-label="Send message" i]');
+    }
+    if (host.includes('claude.ai')) {
+      candidates.push(
+        'button[data-testid="send-button"]',
+        'button[aria-label="Send" i]',
+        '[aria-label="Send message" i]',
+        '[aria-label*="Send message" i]'
+      );
+    }
+    const btns = (form || document).querySelectorAll(candidates.join(","));
+    btns.forEach((b) => {
+      if (!b.__ecoSendHooked) {
+        b.__ecoSendHooked = true;
+        b.addEventListener("click", () => commitSendNowFrom(el));
+      }
+    });
+  } catch (e) {}
   onEdit();
+}
+
+// Global delegated click handler as a safety net for send buttons
+if (!window.__ecoGlobalSendHooked) {
+  window.__ecoGlobalSendHooked = true;
+  const delegatedSelectors = [
+    'button[type="submit"]',
+    '[data-testid*="send"]',
+    '[data-testid="send-button"]',
+    '[aria-label*="Send" i]',
+    '[title*="Send" i]'
+  ];
+  if (location.hostname.includes('chatgpt.com')) {
+    delegatedSelectors.push('button[data-testid="send-button"]', '[aria-label="Send message" i]');
+  }
+  if (location.hostname.includes('claude.ai')) {
+    delegatedSelectors.push(
+      'button[data-testid="send-button"]',
+      'button[aria-label="Send" i]',
+      '[aria-label="Send message" i]',
+      '[aria-label*="Send message" i]'
+    );
+  }
+  document.addEventListener('click', (e) => {
+    try {
+      const target = e.target;
+      if (!(target instanceof Element)) return;
+      const sel = delegatedSelectors.join(',');
+      const btn = target.closest(sel);
+      if (btn) {
+        // Use active editable element as the source
+        const ae = document.activeElement;
+        const source = isEditable(ae) ? ae : (lastFocusedEditable && isEditable(lastFocusedEditable) ? lastFocusedEditable : null);
+        if (source) commitSendNowFrom(source);
+      }
+    } catch (_) {}
+  }, true);
+}
+
+// --- Keyword extraction and pseudo-embeddings ---
+const ECO_STOPWORDS = new Set([
+  "the","a","an","and","or","but","if","then","else","when","at","by","for","in","of","on","to","with","is","are","was","were","be","been","it","this","that","these","those","as","from","about","into","over","after","before","than","so","too","very","can","will","just","not","no","yes","you","your","yours","me","my","we","our","they","their"
+]);
+
+function tokenizeText(t) {
+  return (t || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s_\-]+/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+function extractKeywords(text, maxK = 12) {
+  const toks = tokenizeText(text);
+  const freq = new Map();
+  for (const w of toks) {
+    if (w.length < 3) continue;
+    if (ECO_STOPWORDS.has(w)) continue;
+    freq.set(w, (freq.get(w) || 0) + 1);
+  }
+  return Array.from(freq.entries())
+    .sort((a,b) => b[1]-a[1])
+    .slice(0, maxK)
+    .map(([w]) => w);
+}
+
+function seededHash(str) {
+  let h1 = 2166136261 >>> 0;
+  for (let i=0;i<str.length;i++) {
+    h1 ^= str.charCodeAt(i);
+    h1 = Math.imul(h1, 16777619) >>> 0;
+  }
+  return h1 >>> 0;
+}
+
+function wordToVec(word, dim = 32) {
+  const out = new Float32Array(dim);
+  let seed = seededHash(word);
+  for (let i=0;i<dim;i++) {
+    seed = (seed * 1664525 + 1013904223) >>> 0;
+    const v = ((seed & 0xffff) / 0xffff) * 2 - 1; // [-1,1]
+    out[i] = v;
+  }
+  // normalize
+  let norm = 0; for (let i=0;i<dim;i++) norm += out[i]*out[i];
+  norm = Math.sqrt(norm) || 1;
+  for (let i=0;i<dim;i++) out[i] /= norm;
+  return out;
+}
+
+function embedText(text, dim = 32) {
+  const keys = extractKeywords(text, 12);
+  if (!keys.length) return null;
+  const v = new Float32Array(dim);
+  for (const k of keys) {
+    const wv = wordToVec(k, dim);
+    for (let i=0;i<dim;i++) v[i] += wv[i];
+  }
+  // normalize
+  let norm = 0; for (let i=0;i<dim;i++) norm += v[i]*v[i];
+  norm = Math.sqrt(norm) || 1;
+  for (let i=0;i<dim;i++) v[i] /= norm;
+  return v;
+}
+
+function cosineSim(a, b) {
+  if (!a || !b) return 1;
+  let dot = 0, na = 0, nb = 0;
+  for (let i=0;i<a.length;i++) {
+    const x=a[i], y=b[i];
+    dot += x*y; na += x*x; nb += y*y;
+  }
+  const d = (Math.sqrt(na)||1) * (Math.sqrt(nb)||1);
+  return dot / d;
+}
+
+function updateConversationModel(text) {
+  const ev = embedText(text);
+  if (!ev) return;
+  if (!convoVec) {
+    convoVec = new Float32Array(ev.length);
+    convoCount = 0;
+  }
+  // running average
+  const n = convoCount;
+  for (let i=0;i<ev.length;i++) {
+    const prev = convoVec[i];
+    convoVec[i] = (prev * n + ev[i]) / (n + 1);
+  }
+  convoCount = n + 1;
+  // update keyword frequency set
+  const k = extractKeywords(text, 20);
+  for (const kw of k) {
+    convoKeyFreq.set(kw, (convoKeyFreq.get(kw) || 0) + 1);
+  }
+}
+
+const ECO_DEBUG = false; // set true to log similarity and keywords
+function updateAdviceForText(text) {
+  const w = getWidget();
+  const adv = w.querySelector(`#${ECO_ADVICE_ID}`);
+  if (!adv) return;
+  const keys = extractKeywords(text, 12);
+  const ev = embedText(text);
+  if (!ev || !convoVec || convoCount < 1) {
+    adv.style.display = "none";
+    adv.textContent = "";
+    return;
+  }
+  const sim = cosineSim(ev, convoVec);
+  // keyword overlap ratio (Jaccard-like on keywords)
+  let overlap = 0;
+  if (keys.length && convoKeyFreq.size) {
+    const keySet = new Set(keys);
+    let common = 0;
+    keySet.forEach(k => { if (convoKeyFreq.has(k)) common++; });
+    overlap = common / keySet.size;
+  }
+  if (ECO_DEBUG) {
+    console.log("EcoPrompt advice:", { keys, sim: Number(sim.toFixed(3)), overlap: Number(overlap.toFixed(3)), convoCount });
+  }
+  // Trigger advice if either cosine is low or keyword overlap is low
+  if (sim < 0.6 || overlap < 0.2) {
+    adv.style.display = "block";
+    adv.textContent = "Tip: This prompt seems unrelated. Start a new chat for better efficiency.";
+  } else {
+    adv.style.display = "none";
+    adv.textContent = "";
+  }
 }
 
 function isEditable(node) {
@@ -326,12 +791,42 @@ function hookTextareas() {
   ];
   const nodes = deepQueryAll(selectors);
   nodes.forEach((el) => attachListeners(el));
+  // Also check if conversation changed while DOM updated
+  checkConversationChange();
 }
 
 const observer = new MutationObserver(hookTextareas);
 observer.observe(document.body, { childList: true, subtree: true });
 hookTextareas();
 let rescanTimer = setInterval(hookTextareas, 1500);
+
+// Detect SPA URL changes (new chat) and reset totals
+function patchHistoryForUrlEvents() {
+  try {
+    const origPush = history.pushState;
+    const origReplace = history.replaceState;
+    if (!window.__ecoHistoryPatched) {
+      window.__ecoHistoryPatched = true;
+      history.pushState = function (...args) {
+        const ret = origPush.apply(this, args);
+        window.dispatchEvent(new Event("eco-url-change"));
+        return ret;
+      };
+      history.replaceState = function (...args) {
+        const ret = origReplace.apply(this, args);
+        window.dispatchEvent(new Event("eco-url-change"));
+        return ret;
+      };
+      window.addEventListener("popstate", () => window.dispatchEvent(new Event("eco-url-change")));
+      window.addEventListener("eco-url-change", checkConversationChange);
+    }
+  } catch (e) {}
+}
+
+patchHistoryForUrlEvents();
+checkConversationChange();
+// Fallback polling in case site uses non-history URL changes
+setInterval(checkConversationChange, 2000);
 
 function restorePosition(el) {
   try {
