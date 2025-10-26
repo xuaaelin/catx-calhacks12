@@ -1,0 +1,29 @@
+{
+  "name": "ecoprompt",
+  "version": "1.0.0",
+  "description": "Track and optimize LLM prompt efficiency in real time",
+  "scripts": {
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage"
+  },
+  "jest": {
+    "testEnvironment": "jsdom",
+    "setupFilesAfterEnv": ["<rootDir>/jest.setup.js"],
+    "testMatch": ["**/__tests__/**/*.test.js", "**/?(*.)+(spec|test).js"],
+    "collectCoverageFrom": [
+      "*.js",
+      "!jest.setup.js",
+      "!*.test.js",
+      "!*.spec.js"
+    ],
+    "coveragePathIgnorePatterns": [
+      "/node_modules/",
+      "jest.setup.js"
+    ]
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "jest-environment-jsdom": "^29.7.0"
+  }
+}
