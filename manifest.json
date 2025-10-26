@@ -20,6 +20,19 @@
     "action": {
       "default_popup": "eco.html",
       "default_icon": "catx.png"
-    }
+    },
+    "web_accessible_resources": [
+      {
+        "resources": [
+          "happy1.jpeg",
+          "happy2.jpeg",
+          "lesshappy3.jpeg",
+          "lesshappy4.jpeg",
+          "sad5.jpeg",
+          "sad6.jpeg"
+        ],
+        "matches": ["<all_urls>"]
+      }
+    ]
   }
   
